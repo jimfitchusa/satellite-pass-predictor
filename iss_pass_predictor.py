@@ -1,7 +1,82 @@
+import importlib.util
+import subprocess
+import sys
+
+# --- Pre-run Check: Detect and Offer to Install Required Packages ---
+REQUIRED_PACKAGES = {
+    "skyfield": "skyfield",
+    "tzdata": "tzdata",
+    "timezonefinder": "timezonefinder",
+}
+
+missing = [pkg for module, pkg in REQUIRED_PACKAGES.items() if importlib.util.find_spec(module) is None]
+
+if missing:
+    pkg_list = ", ".join(missing)
+    print(f"Missing required package(s): {pkg_list}")
+    choice = input("Would you like to install them now? [Y/n]: ").strip().lower()
+    if choice in ("", "y", "yes"):
+        print(f"Installing {pkg_list} via pip...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+            print("Installation complete!\n")
+        except subprocess.CalledProcessError as err:
+            sys.exit(f"Error during package installation: {err}")
+    else:
+        sys.exit("Cannot proceed without required dependencies. Exiting.")
+
 import argparse
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from skyfield.api import load, wgs84
+from timezonefinder import TimezoneFinder
+import json
+import shutil
+import urllib.request
+
+# Configure standard urllib opener with a custom User-Agent to satisfy CelesTrak
+opener = urllib.request.build_opener()
+opener.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")]
+urllib.request.install_opener(opener)
+
+
+def get_current_location():
+    """Detects location via Termux hardware GPS, falling back to IP geolocation.
+
+    Returns (lat, lon, elevation_m, location_name)
+    """
+    if shutil.which("termux-location"):
+        try:
+            cmd = ["termux-location", "-p", "network", "-r", "last"]
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if res.returncode == 0 and res.stdout.strip():
+                data = json.loads(res.stdout)
+                lat = data.get("latitude")
+                lon = data.get("longitude")
+                alt = data.get("altitude", 280.0)
+                if lat is not None and lon is not None:
+                    return lat, lon, alt, "Device Location (GPS/Network)"
+        except Exception:
+            pass
+
+    try:
+        req = urllib.request.Request(
+            "https://ipapi.co/json/",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        with urllib.request.urlopen(req, timeout=4) as response:
+            data = json.loads(response.read().decode())
+            lat = data.get("latitude")
+            lon = data.get("longitude")
+            city = data.get("city", "Unknown")
+            region = data.get("region_code", "")
+            loc_name = f"{city}, {region} (IP Geolocation)"
+            if lat is not None and lon is not None:
+                return float(lat), float(lon), 280.0, loc_name
+    except Exception:
+        pass
+
+    return 39.7294, -84.0633, 280.0, "Beavercreek, OH (Default)"
 
 
 def get_compass_16(degrees):
@@ -13,28 +88,32 @@ def get_compass_16(degrees):
     return directions[index]
 
 
-def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0.0, show_sun: bool = False, show_az: bool = False, show_all: bool = False):
-    # --- 1. Observer Location Setup (Beavercreek, OH) ---
-    lat, lon = 39.7294, -84.0633
-    my_location = wgs84.latlon(lat, lon, elevation_m=280)
+def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0.0, show_sun: bool = False, show_az: bool = False, show_all: bool = False, auto_loc: bool = False):
+    # --- 1. Observer Location Setup ---
+    if auto_loc:
+        lat, lon, elev, loc_desc = get_current_location()
+    else:
+        lat, lon, elev, loc_desc = 39.7294, -84.0633, 280.0, "Beavercreek, OH (Manual)"
 
-    # Automatic dynamic timezone (adjusts for Daylight Saving Time per date)
-    local_tz = ZoneInfo("America/New_York")
+    my_location = wgs84.latlon(lat, lon, elevation_m=elev)
+
+    # Automatically resolve timezone from coordinates
+    tf = TimezoneFinder()
+    tz_name = tf.timezone_at(lat=lat, lng=lon) or "America/New_York"
+    local_tz = ZoneInfo(tz_name)
 
     # --- 2. Load Ephemeris & ISS TLE Data ---
     ts = load.timescale()
     t_now = ts.now()
-    
-    # Calculate search start based on the requested start_hours offset
+
     t_start = ts.utc(t_now.utc_datetime() + timedelta(hours=start_hours))
     t_end = ts.utc(t_start.utc_datetime() + timedelta(days=days))
 
-    stations_url = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle'
-    satellites = load.tle_file(stations_url)
+    stations_url = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle'
+    satellites = load.tle_file(stations_url, filename='stations.tle', reload=False)
     by_name = {sat.name: sat for sat in satellites}
     iss = by_name['ISS (ZARYA)']
 
-    # Load Sun ephemeris for twilight & illumination checks
     eph = load('de421.bsp')
     earth, sun = eph['earth'], eph['sun']
 
@@ -43,11 +122,13 @@ def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0
     end_local = t_end.utc_datetime().astimezone(local_tz)
 
     mode_str = "All Geometric Passes (--all enabled)" if show_all else "Visible Passes (Night + Sunlit ISS)"
-    print(f"=== ISS PASS PREDICTIONS ({'ALL' if show_all else 'VISIBLE'}) - Beavercreek, OH ===")
-    print(f"Current Time   : {now_local.strftime('%b %d, %Y, %I:%M %p %Z')}")
-    print(f"Search Window  : {start_local.strftime('%b %d %I:%M %p')} -> {end_local.strftime('%b %d %I:%M %p %Z')} ({days} days)")
-    print(f"Mode           : {mode_str}")
-    print(f"Filter         : Max Alt >= {min_alt}°")
+    print(f"=== ISS PASS PREDICTIONS ({'ALL' if show_all else 'VISIBLE'}) ===")
+    print(f"Observer Location: {loc_desc} [{lat:.4f}°, {lon:.4f}°]")
+    print(f"Current Time     : {now_local.strftime('%b %d, %Y, %I:%M %p %Z')}")
+    print(f"Search Window    : {start_local.strftime('%b %d %I:%M %p')} -> {end_local.strftime('%b %d %I:%M %p %Z')} ({days} days)")
+    print(f"Timezone         : {tz_name}")
+    print(f"Mode             : {mode_str}")
+    print(f"Filter           : Max Alt >= {min_alt}°")
     print("-" * 55)
 
     # --- 3. Find All Pass Geometry ---
@@ -63,8 +144,6 @@ def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0
             t_set = times[i+2] if (i+2 < len(times) and events[i+2] == 2) else None
 
             if t_peak is not None and t_set is not None:
-                # If searching in the past (start_hours < 0), display past passes.
-                # If start_hours >= 0, only display passes that haven't concluded yet.
                 keep_pass = (t_set.tt >= t_now.tt) if start_hours >= 0 else True
 
                 if keep_pass:
@@ -91,7 +170,6 @@ def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0
                         dt_rise_local = t_rise.utc_datetime().astimezone(local_tz)
                         date_header = dt_rise_local.strftime('%b %d, %Y, %I:%M %p %Z')
 
-                        # Status tags
                         if t_set.tt < t_now.tt:
                             status_tag = " [COMPLETED / PAST]"
                         elif t_rise.tt <= t_now.tt <= t_set.tt:
@@ -99,7 +177,6 @@ def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0
                         else:
                             status_tag = ""
 
-                        # Calculate duration
                         _, az_set, _ = (iss - my_location).at(t_set).altaz()
                         dir_set = get_compass_16(az_set.degrees)
                         if show_az:
@@ -138,13 +215,13 @@ def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Predict International Space Station (ISS) passes for Beavercreek, OH."
+        description="Predict International Space Station (ISS) passes."
     )
-    
+
     parser.add_argument(
-        "-d", "--days", 
-        type=int, 
-        default=30, 
+        "-d", "--days",
+        type=int,
+        default=30,
         help="Number of days to search ahead (default: 30)"
     )
     parser.add_argument(
@@ -154,34 +231,40 @@ if __name__ == "__main__":
         help="Search start offset in hours relative to current time (e.g. -4 for 4 hours ago, default: 0.0)"
     )
     parser.add_argument(
-        "-a", "--alt", 
-        type=float, 
-        default=15.0, 
+        "-a", "--alt",
+        type=float,
+        default=15.0,
         help="Minimum required peak elevation angle in degrees (default: 15.0)"
     )
     parser.add_argument(
-        "--all", 
-        action="store_true", 
+        "--all",
+        action="store_true",
         help="Show all geometric passes including daylight and eclipsed passes"
     )
     parser.add_argument(
-        "--az", 
-        action="store_true", 
+        "--az",
+        action="store_true",
         help="Display numerical azimuth degrees alongside compass directions"
     )
     parser.add_argument(
-        "--sun", 
-        action="store_true", 
+        "--sun",
+        action="store_true",
         help="Display the Sun altitude angle in the pass output"
+    )
+    parser.add_argument(
+        "--auto-loc",
+        action="store_true",
+        help="Automatically detect location (uses Termux GPS on mobile, IP lookup on desktop)"
     )
 
     args = parser.parse_args()
 
     predict_passes(
-        days=args.days, 
-        min_alt=args.alt, 
-        start_hours=args.start, 
-        show_sun=args.sun, 
-        show_az=args.az, 
-        show_all=args.all
+        days=args.days,
+        min_alt=args.alt,
+        start_hours=args.start,
+        show_sun=args.sun,
+        show_az=args.az,
+        show_all=args.all,
+        auto_loc=args.auto_loc
     )
