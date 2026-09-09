@@ -6,7 +6,6 @@ import sys
 REQUIRED_PACKAGES = {
     "skyfield": "skyfield",
     "tzdata": "tzdata",
-    "timezonefinder": "timezonefinder",
 }
 
 missing = [pkg for module, pkg in REQUIRED_PACKAGES.items() if importlib.util.find_spec(module) is None]
@@ -29,12 +28,18 @@ import argparse
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from skyfield.api import load, wgs84
-from timezonefinder import TimezoneFinder
 import json
 import shutil
 import urllib.request
 
-# Configure standard urllib opener with a custom User-Agent to satisfy CelesTrak
+# Try importing TimezoneFinder safely (handles missing h3 or broken C builds on mobile)
+try:
+    from timezonefinder import TimezoneFinder
+    HAS_TZFINDER = True
+except (ImportError, ModuleNotFoundError):
+    HAS_TZFINDER = False
+
+# Configure urllib opener with custom User-Agent to prevent CelesTrak 403 Forbidden
 opener = urllib.request.build_opener()
 opener.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")]
 urllib.request.install_opener(opener)
@@ -97,9 +102,18 @@ def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0
 
     my_location = wgs84.latlon(lat, lon, elevation_m=elev)
 
-    # Automatically resolve timezone from coordinates
-    tf = TimezoneFinder()
-    tz_name = tf.timezone_at(lat=lat, lng=lon) or "America/New_York"
+    # --- Timezone Detection with Fallback ---
+    tz_name = None
+    if HAS_TZFINDER:
+        try:
+            tf = TimezoneFinder()
+            tz_name = tf.timezone_at(lat=lat, lng=lon)
+        except Exception:
+            pass
+
+    if not tz_name:
+        tz_name = "America/New_York"
+
     local_tz = ZoneInfo(tz_name)
 
     # --- 2. Load Ephemeris & ISS TLE Data ---
