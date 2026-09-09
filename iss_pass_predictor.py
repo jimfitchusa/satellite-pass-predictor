@@ -182,7 +182,7 @@ def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0
                             dir_peak += f" ({az_peak.degrees:.1f}°)"
 
                         dt_rise_local = t_rise.utc_datetime().astimezone(local_tz)
-                        date_header = dt_rise_local.strftime('%b %d, %Y, %I:%M %p %Z')
+                        date_header = dt_rise_local.strftime('%a %b %d, %Y, %I:%M %p %Z')
 
                         if t_set.tt < t_now.tt:
                             status_tag = " [COMPLETED / PAST]"
