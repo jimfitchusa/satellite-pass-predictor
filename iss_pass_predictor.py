@@ -6,6 +6,7 @@ import sys
 REQUIRED_PACKAGES = {
     "skyfield": "skyfield",
     "tzdata": "tzdata",
+    "geopy": "geopy",
 }
 
 missing = [pkg for module, pkg in REQUIRED_PACKAGES.items() if importlib.util.find_spec(module) is None]
@@ -32,52 +33,52 @@ import json
 import shutil
 import urllib.request
 
-# Try importing TimezoneFinder safely (handles missing h3 or broken C builds on mobile)
+# Try importing TimezoneFinder safely; handles missing C modules on mobile gracefully
 try:
     from timezonefinder import TimezoneFinder
     HAS_TZFINDER = True
 except (ImportError, ModuleNotFoundError):
     HAS_TZFINDER = False
 
-# Configure urllib opener with custom User-Agent to prevent CelesTrak 403 Forbidden
+# Configure urllib opener with custom User-Agent to satisfy CelesTrak anti-scraping
 opener = urllib.request.build_opener()
 opener.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")]
 urllib.request.install_opener(opener)
 
 
+def resolve_custom_location(query: str):
+    """Resolves a city name, address, or ZIP code to (lat, lon, elev, label)."""
+    try:
+        from geopy.geocoders import Nominatim
+        geolocator = Nominatim(user_agent="satellite-pass-predictor")
+        loc = geolocator.geocode(query, timeout=5)
+        if loc:
+            # Truncate long address strings to the first two components
+            parts = [p.strip() for p in loc.address.split(",")]
+            short_label = ", ".join(parts[:2]) if len(parts) >= 2 else parts[0]
+            return loc.latitude, loc.longitude, 280.0, f"{short_label} ({query})"
+    except Exception as err:
+        print(f"Warning: Geocoding lookup failed ({err}).")
+    return None
+
+
 def get_current_location():
-    """Detects location via Termux hardware GPS, falling back to IP geolocation.
-
-    Returns (lat, lon, elevation_m, location_name)
-    """
-    if shutil.which("termux-location"):
-        try:
-            cmd = ["termux-location", "-p", "network", "-r", "last"]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-            if res.returncode == 0 and res.stdout.strip():
-                data = json.loads(res.stdout)
-                lat = data.get("latitude")
-                lon = data.get("longitude")
-                alt = data.get("altitude", 280.0)
-                if lat is not None and lon is not None:
-                    return lat, lon, alt, "Device Location (GPS/Network)"
-        except Exception:
-            pass
-
+    """Fallback: IP-based Geolocation when running without GPS."""
     try:
         req = urllib.request.Request(
-            "https://ipapi.co/json/",
+            "http://ip-api.com/json/",
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         )
         with urllib.request.urlopen(req, timeout=4) as response:
             data = json.loads(response.read().decode())
-            lat = data.get("latitude")
-            lon = data.get("longitude")
-            city = data.get("city", "Unknown")
-            region = data.get("region_code", "")
-            loc_name = f"{city}, {region} (IP Geolocation)"
-            if lat is not None and lon is not None:
-                return float(lat), float(lon), 280.0, loc_name
+            if data.get("status") == "success":
+                lat = data.get("lat")
+                lon = data.get("lon")
+                city = data.get("city", "Unknown")
+                region = data.get("region", "")
+                loc_name = f"{city}, {region} (IP Geolocation)"
+                if lat is not None and lon is not None:
+                    return float(lat), float(lon), 280.0, loc_name
     except Exception:
         pass
 
@@ -93,21 +94,41 @@ def get_compass_16(degrees):
     return directions[index]
 
 
-def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0.0, show_sun: bool = False, show_az: bool = False, show_all: bool = False, auto_loc: bool = False):
+def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0.0, show_sun: bool = False, show_az: bool = False, show_all: bool = False, auto_loc: bool = False, loc_query: str = None):
     # --- 1. Observer Location Setup ---
-    if auto_loc:
+    if loc_query:
+        resolved = resolve_custom_location(loc_query)
+        if resolved:
+            lat, lon, elev, loc_desc = resolved
+        else:
+            print(f"Could not resolve '{loc_query}'. Falling back to default.")
+            lat, lon, elev, loc_desc = 39.7294, -84.0633, 280.0, "Beavercreek, OH (Default)"
+    elif auto_loc:
         lat, lon, elev, loc_desc = get_current_location()
     else:
         lat, lon, elev, loc_desc = 39.7294, -84.0633, 280.0, "Beavercreek, OH (Manual)"
 
     my_location = wgs84.latlon(lat, lon, elevation_m=elev)
 
-    # --- Timezone Detection with Fallback ---
+    # --- Timezone Detection with Web Fallback ---
     tz_name = None
     if HAS_TZFINDER:
         try:
             tf = TimezoneFinder()
             tz_name = tf.timezone_at(lat=lat, lng=lon)
+        except Exception:
+            pass
+
+    # Web fallback for timezone if TimezoneFinder is unavailable
+    if not tz_name:
+        try:
+            req = urllib.request.Request(
+                f"https://timeapi.io/api/time/current/coordinate?latitude={lat}&longitude={lon}",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                tz_data = json.loads(resp.read().decode())
+                tz_name = tz_data.get("timeZone")
         except Exception:
             pass
 
@@ -182,7 +203,7 @@ def predict_passes(days: int = 30, min_alt: float = 15.0, start_hours: float = 0
                             dir_peak += f" ({az_peak.degrees:.1f}°)"
 
                         dt_rise_local = t_rise.utc_datetime().astimezone(local_tz)
-                        date_header = dt_rise_local.strftime('%a %b %d, %Y, %I:%M %p %Z')
+                        date_header = dt_rise_local.strftime('%b %d, %Y, %I:%M %p %Z')
 
                         if t_set.tt < t_now.tt:
                             status_tag = " [COMPLETED / PAST]"
@@ -266,9 +287,15 @@ if __name__ == "__main__":
         help="Display the Sun altitude angle in the pass output"
     )
     parser.add_argument(
+        "-l", "--loc",
+        type=str,
+        default=None,
+        help="Target location as a city or ZIP code (e.g. '45431' or 'Denver, CO')"
+    )
+    parser.add_argument(
         "--auto-loc",
         action="store_true",
-        help="Automatically detect location (uses Termux GPS on mobile, IP lookup on desktop)"
+        help="Automatically detect location via IP lookup"
     )
 
     args = parser.parse_args()
@@ -280,5 +307,6 @@ if __name__ == "__main__":
         show_sun=args.sun,
         show_az=args.az,
         show_all=args.all,
-        auto_loc=args.auto_loc
+        auto_loc=args.auto_loc,
+        loc_query=args.loc
     )
