@@ -86,7 +86,7 @@ def resolve_custom_location(query: str):
             return loc.latitude, loc.longitude, 280.0, f"{short_label} ({query})"
     except Exception as err:
         print(f"Warning: Geocoding lookup failed ({err}).")
-    return None
+    return None 
 
 
 def get_current_location():
