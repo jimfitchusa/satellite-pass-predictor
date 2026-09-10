@@ -1,6 +1,8 @@
 import importlib.util
 import subprocess
 import sys
+import re
+
 
 # --- Pre-run Check: Detect and Offer to Install Required Packages ---
 REQUIRED_PACKAGES = {
@@ -46,16 +48,41 @@ opener.addheaders = [("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 urllib.request.install_opener(opener)
 
 
+import re
+
 def resolve_custom_location(query: str):
     """Resolves a city name, address, or ZIP code to (lat, lon, elev, label)."""
     try:
         from geopy.geocoders import Nominatim
         geolocator = Nominatim(user_agent="satellite-pass-predictor")
-        loc = geolocator.geocode(query, timeout=5)
+        
+        # Clean input
+        q = query.strip()
+        
+        # If it's a 5-digit US ZIP code (e.g. "45434" or "45434-1234")
+        if re.match(r"^\d{5}(-\d{4})?$", q):
+            loc = geolocator.geocode(
+                {"postalcode": q[:5], "country": "US"}, 
+                addressdetails=True, 
+                timeout=5
+            )
+        else:
+            loc = geolocator.geocode(q, addressdetails=True, timeout=5)
+            
         if loc:
-            # Truncate long address strings to the first two components
-            parts = [p.strip() for p in loc.address.split(",")]
-            short_label = ", ".join(parts[:2]) if len(parts) >= 2 else parts[0]
+            raw = loc.raw.get("address", {})
+            city = raw.get("city") or raw.get("town") or raw.get("village") or raw.get("hamlet") or raw.get("county")
+            state = raw.get("state")
+            country = raw.get("country_code", "").upper()
+            
+            if city and state:
+                short_label = f"{city}, {state}"
+            elif city and country:
+                short_label = f"{city}, {country}"
+            else:
+                parts = [p.strip() for p in loc.address.split(",")]
+                short_label = ", ".join(parts[:2]) if len(parts) >= 2 else parts[0]
+                
             return loc.latitude, loc.longitude, 280.0, f"{short_label} ({query})"
     except Exception as err:
         print(f"Warning: Geocoding lookup failed ({err}).")
